@@ -1,65 +1,538 @@
-name: Archive and Release
+name: ⚙️ Advanced Archive and Release
 
 on:
-  # Allow manual triggering
+  push:
+    branches: 
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - '.github/workflows/**'
+  
+  pull_request:
+    types: [closed]
+    branches: [main]
+  
   workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release Type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+          - prerelease
+      custom_version:
+        description: 'Custom Version (optional, overrides release_type)'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark as prerelease'
+        required: false
+        default: false
+        type: boolean
+
+  schedule:
+    - cron: '0 2 * * 1'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  FILENAME: 'Revi-PB-${{ github.event.workflow_run.started_at }}.apbx'
+  ARTIFACT_NAME: 'Revi-PB'
+  ARCHIVE_EXTENSION: '.apbx'
+  ARCHIVE_PASSWORD: 'malte'
 
 jobs:
-  build:
-    runs-on: windows-latest
+  check-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version_type: ${{ steps.check.outputs.version_type }}
+    
+    steps:
+      - name: Verify PR was merged
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged != true
+        run: |
+          echo "Pull request was closed without merging. Skipping workflow."
+          exit 0
 
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && 'main' || github.ref }}
+
+      - name: Analyze changes and determine build requirements
+        id: check
+        run: |
+          echo "Analyzing repository state..."
+          
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger detected - proceeding with build"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "version_type=${{ github.event.inputs.release_type || 'patch' }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Scheduled check - looking for unreleased changes"
+            LAST_TAG=$(git describe --abbrev=0 --match "v*" 2>/dev/null || echo "")
+            
+            if [ -z "$LAST_TAG" ]; then
+              echo "No previous releases found - skipping scheduled build"
+              echo "should_build=false" >> $GITHUB_OUTPUT
+              echo "version_type=patch" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            
+            CHANGES=$(git diff --name-only $LAST_TAG..HEAD -- src/ .github/workflows/ 2>/dev/null || echo "")
+            if [ -z "$CHANGES" ]; then
+              echo "No changes detected since last release"
+              echo "should_build=false" >> $GITHUB_OUTPUT
+              echo "version_type=patch" >> $GITHUB_OUTPUT
+            else
+              echo "Unreleased changes found - creating automated release"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+              echo "version_type=patch" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          
+          LAST_TAG=$(git describe --abbrev=0 --match "v*" 2>/dev/null || echo "")
+          echo "Last release tag: $LAST_TAG"
+          
+          if [ -z "$LAST_TAG" ]; then
+            echo "No previous releases - will create initial release"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "version_type=minor" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          CHANGES=$(git diff --name-only $LAST_TAG..HEAD -- src/ .github/workflows/ 2>/dev/null || echo "")
+          
+          if [ -n "$CHANGES" ]; then
+            echo "Changes detected in source files"
+            
+            COMMITS=$(git log $LAST_TAG..HEAD --oneline 2>/dev/null || echo "")
+            
+            VERSION_TYPE="patch"
+            if echo "$COMMITS" | grep -iE "BREAKING|major:" >/dev/null 2>&1; then
+              VERSION_TYPE="major"
+              echo "Breaking changes detected - major version bump"
+            elif echo "$COMMITS" | grep -iE "feat|feature|minor:" >/dev/null 2>&1; then
+              VERSION_TYPE="minor"
+              echo "New features detected - minor version bump"
+            else
+              echo "Bug fixes or patches detected - patch version bump"
+            fi
+            
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "version_type=$VERSION_TYPE" >> $GITHUB_OUTPUT
+          else
+            echo "No relevant changes detected"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "version_type=patch" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-release:
+    needs: check-changes
+    runs-on: windows-latest
+    timeout-minutes: 30
+    if: needs.check-changes.outputs.should_build == 'true'
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      filename: ${{ steps.version.outputs.filename }}
+      hash: ${{ steps.hash.outputs.hash }}
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: 'main'
+          fetch-depth: 0
 
-      - name: Set version
-        id: set_version
-        run: |
-          # Get current date in "YY.MM" format
-          CURRENT_DATE=$(date +%y.%m)
-          echo "VERSION=${CURRENT_DATE}" >> $GITHUB_ENV
+      - name: Calculate version number
+        id: version
         shell: bash
+        run: |
+          echo "Calculating next version number..."
+          
+          # Check for custom version
+          if [ -n "${{ github.event.inputs.custom_version }}" ]; then
+            VERSION="${{ github.event.inputs.custom_version }}"
+            echo "Using custom version: $VERSION"
+          else
+            # Get current version from git tags
+            CURRENT_VERSION="1.0.0"
+            if git describe --abbrev=0 --match "v*" >/dev/null 2>&1; then
+              CURRENT_VERSION=$(git describe --abbrev=0 --match "v*" | sed 's/^v//')
+              echo "Current version from tag: $CURRENT_VERSION"
+            else
+              echo "No previous tags found, starting from: $CURRENT_VERSION"
+            fi
+            
+            # Parse version components
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+            MAJOR=${MAJOR:-1}
+            MINOR=${MINOR:-0}
+            PATCH=${PATCH:-0}
+            
+            # Increment version based on type
+            case "${{ needs.check-changes.outputs.version_type }}" in
+              major)
+                MAJOR=$((MAJOR + 1))
+                MINOR=0
+                PATCH=0
+                echo "Major version bump: $CURRENT_VERSION -> $MAJOR.0.0"
+                ;;
+              minor)
+                MINOR=$((MINOR + 1))
+                PATCH=0
+                echo "Minor version bump: $CURRENT_VERSION -> $MAJOR.$MINOR.0"
+                ;;
+              patch)
+                PATCH=$((PATCH + 1))
+                echo "Patch version bump: $CURRENT_VERSION -> $MAJOR.$MINOR.$PATCH"
+                ;;
+              prerelease)
+                PATCH=$((PATCH + 1))
+                TIMESTAMP=$(date +%Y%m%d%H%M%S)
+                VERSION="$MAJOR.$MINOR.$PATCH-pre.$TIMESTAMP"
+                echo "Prerelease version: $VERSION"
+                ;;
+            esac
+            
+            if [ "${{ needs.check-changes.outputs.version_type }}" != "prerelease" ]; then
+              VERSION="$MAJOR.$MINOR.$PATCH"
+            fi
+          fi
+          
+          FILENAME="${{ env.ARTIFACT_NAME }}-$VERSION${{ env.ARCHIVE_EXTENSION }}"
+          
+          echo "Final version: $VERSION"
+          echo "Archive filename: $FILENAME"
+          
+          # Set outputs using official GitHub Actions syntax
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
 
-      - name: Update version
+      - name: Update version in configuration files
+        shell: pwsh
         run: |
           $version = "${{ env.VERSION }}"
           $playbookConfPath = "src\playbook.conf"
           $finalizeCMDPath = "src\Executables\FINALIZE.cmd"
+          
+          Write-Host "Updating configuration files to version: $version"
+          
+          if (Test-Path $playbookConfPath) {
+            $content = Get-Content -Path $playbookConfPath -Raw
+            $content = $content -replace '<Version>.*</Version>', "<Version>$version</Version>"
+            Set-Content -Path $playbookConfPath -Value $content -NoNewline
+            Write-Host "Updated $playbookConfPath"
+          } else {
+            Write-Warning "$playbookConfPath not found"
+          }
+          
+          if (Test-Path $finalizeCMDPath) {
+            $content = Get-Content -Path $finalizeCMDPath -Raw
+            $content = $content -replace 'set version=.+', "set version=$version"
+            Set-Content -Path $finalizeCMDPath -Value $content -NoNewline
+            Write-Host "Updated $finalizeCMDPath"
+          } else {
+            Write-Warning "$finalizeCMDPath not found"
+          }
 
-          (Get-Content -Path $playbookConfPath) -replace '<Version>.*</Version>', "<Version>$version</Version>" | Set-Content -Path $playbookConfPath
-
-          (Get-Content -Path $finalizeCMDPath) -replace 'set version=.+', "set version=$version" | Set-Content -Path $finalizeCMDPath
+      - name: Validate source directory
         shell: pwsh
-
-      - name: Archive content
         run: |
-          7z a -pmalte -mhe=on "Revi-PB-${{ env.VERSION }}.apbx" ./src/*
+          if (-not (Test-Path "src")) {
+            Write-Error "Source directory 'src' not found!"
+            exit 1
+          }
+          
+          $srcFiles = Get-ChildItem -Path "src" -Recurse -File
+          Write-Host "Found $($srcFiles.Count) files in source directory"
+          
+          if ($srcFiles.Count -eq 0) {
+            Write-Error "Source directory is empty!"
+            exit 1
+          }
 
-      - name: Generate SHA256
+      - name: Create encrypted archive
+        shell: pwsh
         run: |
-          $hash = (Get-FileHash -Algorithm SHA256 -Path "Revi-PB-${{ env.VERSION }}.apbx").Hash
-          echo ("HASH=" + $hash) >> $env:GITHUB_ENV
+          Write-Host "Creating encrypted archive: ${{ env.FILENAME }}"
+          
+          # Check if 7-Zip is available
+          if (-not (Get-Command "7z" -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing 7-Zip..."
+            choco install 7zip -y
+            
+            # Refresh PATH
+            $env:PATH = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+            
+            # Verify installation
+            if (-not (Get-Command "7z" -ErrorAction SilentlyContinue)) {
+              $7zipPath = "C:\Program Files\7-Zip\7z.exe"
+              if (-not (Test-Path $7zipPath)) {
+                Write-Error "7-Zip installation failed!"
+                exit 1
+              }
+              Set-Alias -Name 7z -Value $7zipPath -Scope Script
+            }
+          }
+          
+          Write-Host "Compressing files with encryption..."
+          $output = & 7z a -p"${{ env.ARCHIVE_PASSWORD }}" -mhe=on "${{ env.FILENAME }}" "./src/*" 2>&1
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "7-Zip compression failed with exit code: $LASTEXITCODE"
+            Write-Error $output
+            exit 1
+          }
+          
+          if (-not (Test-Path "${{ env.FILENAME }}")) {
+            Write-Error "Archive file was not created!"
+            exit 1
+          }
+          
+          Write-Host "Validating archive integrity..."
+          $testOutput = & 7z t -p"${{ env.ARCHIVE_PASSWORD }}" "${{ env.FILENAME }}" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Archive validation failed!"
+            Write-Error $testOutput
+            exit 1
+          }
+          
+          $fileSize = (Get-Item "${{ env.FILENAME }}").Length
+          Write-Host "Archive created and validated successfully"
+          Write-Host "File size: $([math]::Round($fileSize/1MB, 2)) MB"
 
-      - name: Release
-        uses: svenstaro/upload-release-action@v2
+      - name: Generate integrity checksums
+        id: hash
+        shell: bash
+        run: |
+          echo "Generating file checksums..."
+          
+          # Generate checksums
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHA256_HASH=$(sha256sum "${{ env.FILENAME }}" | awk '{print $1}')
+            MD5_HASH=$(md5sum "${{ env.FILENAME }}" | awk '{print $1}')
+          else
+            # Fallback for systems without sha256sum
+            SHA256_HASH=$(openssl dgst -sha256 "${{ env.FILENAME }}" | awk '{print $2}')
+            MD5_HASH=$(openssl dgst -md5 "${{ env.FILENAME }}" | awk '{print $2}')
+          fi
+          
+          echo "SHA256: $SHA256_HASH"
+          echo "MD5: $MD5_HASH"
+          
+          # Save checksums to files
+          echo "$SHA256_HASH  ${{ env.FILENAME }}" > SHA256SUMS
+          echo "$MD5_HASH  ${{ env.FILENAME }}" > MD5SUMS
+          
+          # Set outputs
+          echo "SHA256_HASH=$SHA256_HASH" >> $GITHUB_ENV
+          echo "MD5_HASH=$MD5_HASH" >> $GITHUB_ENV
+          echo "hash=$SHA256_HASH" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }} # Uses GitHub token for authentication
-          file: "Revi-PB-${{ env.VERSION }}.apbx"
-          asset_name: "Revi-PB-${{ env.VERSION }}.apbx"
-          tag: ${{ env.VERSION }}
-          overwrite: true
-          release_name: ${{ env.VERSION }}
-          prerelease: false # Always set to false
+          name: release-artifacts-${{ env.VERSION }}
+          path: |
+            ${{ env.FILENAME }}
+            SHA256SUMS
+            MD5SUMS
+          retention-days: 14
+          if-no-files-found: error
+
+  create-release:
+    needs: [check-changes, build-and-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: needs.build-and-release.result == 'success'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts-${{ needs.build-and-release.outputs.version }}
+
+      - name: Generate changelog from commits
+        id: changelog
+        run: |
+          echo "Generating release changelog..."
+          
+          VERSION="${{ needs.build-and-release.outputs.version }}"
+          LAST_TAG=$(git describe --abbrev=0 --match "v*" 2>/dev/null || echo "")
+          
+          CHANGELOG="## What's Changed"$'\n\n'
+          
+          if [ -n "$LAST_TAG" ]; then
+            COMMITS=$(git log $LAST_TAG..HEAD --pretty=format:"* %s (%h)" --no-merges 2>/dev/null | sed 's/`/\\`/g' || echo "")
+            if [ -n "$COMMITS" ]; then
+              CHANGELOG="$CHANGELOG$COMMITS"$'\n\n'
+            fi
+            
+            CONTRIBUTORS=$(git log $LAST_TAG..HEAD --pretty=format:"%an" --no-merges 2>/dev/null | sort -u | sed 's/^/* @/' || echo "")
+            if [ -n "$CONTRIBUTORS" ]; then
+              CHANGELOG="${CHANGELOG}## Contributors"$'\n'"$CONTRIBUTORS"$'\n\n'
+            fi
+          else
+            CHANGELOG="${CHANGELOG}* Initial release"$'\n\n'
+          fi
+          
+          CHANGELOG="${CHANGELOG}## Technical Details"$'\n'
+          CHANGELOG="${CHANGELOG}* Build Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"$'\n'
+          CHANGELOG="${CHANGELOG}* Build Environment: GitHub Actions"$'\n'
+          CHANGELOG="${CHANGELOG}* Archive Format: APBX (7-Zip encrypted)"$'\n\n'
+          
+          {
+            echo 'changelog<<EOF'
+            echo "$CHANGELOG"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+      - name: Determine prerelease status
+        id: prerelease
+        run: |
+          IS_PRERELEASE="false"
+          VERSION="${{ needs.build-and-release.outputs.version }}"
+          
+          if [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            IS_PRERELEASE="true"
+          fi
+          
+          if [[ "$VERSION" =~ (alpha|beta|rc|pre|dev) ]]; then
+            IS_PRERELEASE="true"
+          fi
+          
+          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            IS_PRERELEASE="true"
+          fi
+          
+          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.build-and-release.outputs.version }}
+          name: Revi Playbook v${{ needs.build-and-release.outputs.version }}
           body: |
-            # Download Link ✨
+            # 🎉 Revi Playbook v${{ needs.build-and-release.outputs.version }}
+            
+            ${{ steps.changelog.outputs.changelog }}
+            
+            ## 📥 Download & Installation
+            
+            Download the playbook archive from the assets section below.
+            
+            **Archive Password:** `${{ env.ARCHIVE_PASSWORD }}`
+            
+            The archive is password-protected for compatibility with AME Wizard.
+            
+            ## 🔒 Verify Download Integrity
+            
+            **SHA256 Checksum**: `${{ needs.build-and-release.outputs.hash }}`
+            
+            Verify the file integrity after download:
+            
+            **Linux/macOS:**
+            ```bash
+            sha256sum ${{ needs.build-and-release.outputs.filename }}
+            ```
+            
+            **Windows PowerShell:**
+            ```powershell
+            Get-FileHash -Algorithm SHA256 ${{ needs.build-and-release.outputs.filename }}
+            ```
+            
+            The output should match the checksum above.
+            
+            ## 💝 Support the Project
+            
+            If you find this playbook useful:
+            - ⭐ Star this repository
+            - 🐛 Report bugs and issues
+            - 🚀 Contribute improvements via pull requests
+            - 📢 Share with others who might benefit
+            
+            ---
+            
+            *Automatically built and released via GitHub Actions*
+          files: |
+            ${{ needs.build-and-release.outputs.filename }}
+            SHA256SUMS
+            MD5SUMS
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+          draft: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            If you would like to support Revision, kindly download the Playbook from the provided link below.
+  notify:
+    needs: [check-changes, build-and-release, create-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    
+    steps:
+      - name: Success notification
+        if: needs.create-release.result == 'success'
+        run: |
+          echo "Release v${{ needs.build-and-release.outputs.version }} published successfully"
+          echo "Download URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-and-release.outputs.version }}"
 
-            📌Link: 
+      - name: Failure notification
+        if: failure()
+        run: |
+          echo "Workflow execution failed"
+          echo "Please review the logs above for details"
 
-            SHA256: `${{ env.HASH }}`
+  cleanup:
+    needs: [build-and-release, create-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: always()
+    
+    steps:
+      - name: Clean up old artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: artifacts } = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            
+            const oldArtifacts = artifacts.artifacts
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+              .slice(10);
+            
+            for (const artifact of oldArtifacts) {
+              if (artifact.name.startsWith('release-artifacts-')) {
+                console.log(`Removing old artifact: ${artifact.name}`);
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id
+                });
+              }
+            }
