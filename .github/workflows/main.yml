@@ -361,6 +361,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: needs.build-and-release.result == 'success'
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout code
